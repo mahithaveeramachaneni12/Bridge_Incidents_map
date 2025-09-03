@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Bridge Incidents — Pins + Type Filter</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- MarkerCluster (optional) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    .topbar {
+      position: absolute; z-index: 1000; top: 10px; left: 10px;
+      background: rgba(255,255,255,0.95); padding: 8px 10px; border-radius: 10px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.15);
+      font: 14px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      display: flex; gap: 8px; align-items: center;
+    }
+    .legend {
+      background: white; padding: 10px 10px 6px; line-height: 1.2;
+      border-radius: 8px; box-shadow: 0 1px 6px rgba(0,0,0,0.15);
+      font: 13px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    }
+    .legend .row { display: flex; align-items: center; margin-bottom: 6px; }
+    .legend .swatch { width: 14px; height: 14px; border-radius: 50%;
+      margin-right: 8px; border: 1px solid rgba(0,0,0,0.25); box-sizing: border-box; }
+    .status {
+      position: absolute; left: 10px; bottom: 10px; background: rgba(255,255,255,0.9);
+      padding: 6px 8px; border-radius: 6px; font: 12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.15); max-width: 60vw; overflow: auto; max-height: 30vh; white-space: pre-wrap;
+    }
+    select { padding: 4px 6px; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div class="topbar">
+    <label for="typeFilter"><strong>Incident type:</strong></label>
+    <select id="typeFilter"><option value="__ALL__">All types</option></select>
+  </div>
+
+  <pre class="status" id="status">Loading…</pre>
+
+  <script>
+    const map = L.map('map', { preferCanvas: true }).setView([31, -99], 6);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    const status = document.getElementById('status');
+    const typeFilter = document.getElementById('typeFilter');
+
+    // Helpers
+    function sanitizeJsonText(txt) {
+      return txt.replace(/\bNaN\b/g, 'null')
+                .replace(/\b-Infinity\b/g, 'null')
+                .replace(/\bInfinity\b/g, 'null');
+    }
+    function looksSwapped([x,y]) {
+      return (Math.abs(x) <= 90 && Math.abs(y) <= 180) && !(Math.abs(y) <= 90);
+    }
+    function normalizeGeoJSON(gj) {
+      if (!gj || !Array.isArray(gj.features)) return { type:'FeatureCollection', features:[] };
+      const out = { type:'FeatureCollection', features:[] };
+      for (let f of gj.features) {
+        if (!f) continue;
+        if (!f.geometry) {
+          const p = f.properties || {};
+          const latK = Object.keys(p).find(k => /^(lat|latitude)$/i.test(k));
+          const lonK = Object.keys(p).find(k => /^(lon|lng|long|longitude)$/i.test(k));
+          if (latK && lonK) {
+            const lat = parseFloat(p[latK]), lon = parseFloat(p[lonK]);
+            if (isFinite(lat) && isFinite(lon)) {
+              out.features.push({ type:'Feature', properties:p, geometry:{ type:'Point', coordinates:[lon,lat] }});
+            }
+          }
+          continue;
+        }
+        if (f.geometry.type === 'Point' && Array.isArray(f.geometry.coordinates)) {
+          let [x,y] = f.geometry.coordinates;
+          x = parseFloat(x); y = parseFloat(y);
+          if (!isFinite(x) || !isFinite(y)) continue;
+          const coords = looksSwapped([x,y]) ? [y,x] : [x,y];
+          out.features.push({ type:'Feature', properties:f.properties || {}, geometry:{ type:'Point', coordinates:coords }});
+        }
+      }
+      return out;
+    }
+
+    const palette = ["#e41a1c","#377eb8","#4daf4a","#984ea3","#ff7f00","#a65628","#f781bf","#999999",
+                     "#66c2a5","#fc8d62","#8da0cb","#e78ac3","#a6d854","#ffd92f","#e5c494","#b3b3b3"];
+
+    function colorMapFor(types) {
+      const m = {};
+      types.forEach((t,i) => m[t] = palette[i % palette.length]);
+      return m;
+    }
+
+    function makeSvgPin(color) {
+      return `
+        <svg width="24" height="36" viewBox="0 0 24 36" xmlns="http://www.w3.org/2000/svg">
+          <path d="M12 35c5-8 10-12 10-19C22 8.82 17.18 4 12 4S2 8.82 2 16c0 7 5 11 10 19z"
+                fill="${color}" stroke="rgba(0,0,0,0.45)" stroke-width="1"/>
+          <circle cx="12" cy="16" r="4.2" fill="white" opacity="0.9"/>
+        </svg>`;
+    }
+    function makePinIcon(color) {
+      return L.divIcon({
+        className: 'custom-pin',
+        html: makeSvgPin(color),
+        iconSize: [24, 36],
+        iconAnchor: [12, 34],
+        popupAnchor: [0, -30]
+      });
+    }
+
+    // Popup builder with links
+    function makePopup(props) {
+      if (!props) return '';
+      const rows = [];
+      const isUrl = v => typeof v === 'string' && /^https?:\/\//i.test(v);
+      const domainText = url => {
+        try { return new URL(url).hostname.replace(/^www\./, ''); }
+        catch { return url; }
+      };
+      for (const [k, rawV] of Object.entries(props)) {
+        if (rawV === null || rawV === undefined) continue;
+        let v = String(rawV).trim();
+        if (!v || v.toLowerCase() === 'null') continue;
+        if (isUrl(v)) {
+          v = `<a href="${rawV}" target="_blank" rel="noopener">${domainText(rawV)}</a>`;
+        }
+        rows.push(`<tr><th style="text-align:left; padding-right:8px;">${k}</th><td>${v}</td></tr>`);
+      }
+      return `<div style="font:13px/1.3 system-ui, Segoe UI, Roboto, Arial;"><table>${rows.join('')}</table></div>`;
+    }
+
+    function normalizeType(v) {
+      if (v == null) return null;
+      v = String(v).toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
+      const dict = {
+        'flooding': 'flood',
+        'floods': 'flood',
+        'fires': 'fire',
+        'collisions': 'collision',
+        'overloaded truck': 'vehicle overload',
+        'truck overload': 'vehicle overload',
+        'vehicle overloads': 'vehicle overload'
+      };
+      if (dict[v]) return dict[v];
+      if (/ies$/.test(v)) v = v.replace(/ies$/, 'y');
+      else if (/(ses|xes|zes|ches|shes)$/.test(v)) v = v.replace(/es$/, '');
+      else if (v.endsWith('s') && !v.endsWith('ss')) v = v.slice(0, -1);
+      return v;
+    }
+    function titleCase(s) {
+      return String(s).replace(/\w\S*/g, t => t[0].toUpperCase() + t.slice(1).toLowerCase());
+    }
+
+    let allCluster = null;
+    let groupsByType = {};
+    const INCIDENT_KEY = 'Incident Type';
+
+    fetch('bridge_incidents.geojson', { cache:'no-store' })
+      .then(r => r.text())
+      .then(txt => {
+        const raw = JSON.parse(sanitizeJsonText(txt));
+        const data = normalizeGeoJSON(raw);
+        if (!data.features.length) throw new Error('No valid point features found.');
+
+        const typeLabelMap = new Map();
+        data.features.forEach(f => {
+          const norm = normalizeType(f.properties?.[INCIDENT_KEY]);
+          if (norm != null && !typeLabelMap.has(norm)) {
+            typeLabelMap.set(norm, titleCase(norm));
+          }
+        });
+        const typeValues = Array.from(typeLabelMap.keys()).sort();
+        const colors = colorMapFor(typeValues);
+
+        for (const norm of typeValues) {
+          const opt = document.createElement('option');
+          opt.value = norm; opt.textContent = typeLabelMap.get(norm);
+          typeFilter.appendChild(opt);
+        }
+
+        groupsByType = {};
+        typeValues.forEach(norm => groupsByType[norm] = L.layerGroup());
+        const cluster = L.markerClusterGroup({ spiderfyOnMaxZoom:true, showCoverageOnHover:false, maxClusterRadius:50 });
+
+        data.features.forEach(f => {
+          const tNorm = normalizeType(f.properties?.[INCIDENT_KEY]);
+          if (tNorm == null) return;
+          const [lon, lat] = f.geometry.coordinates;
+          const m = L.marker([lat, lon], {
+            icon: makePinIcon(colors[tNorm] || '#666'),
+            title: typeLabelMap.get(tNorm) || ''
+          }).bindPopup(makePopup(f.properties));
+          groupsByType[tNorm].addLayer(m);
+          cluster.addLayer(m);
+        });
+
+        cluster.addTo(map);
+        allCluster = cluster;
+        const b = cluster.getBounds();
+        if (b.isValid()) map.fitBounds(b.pad(0.1));
+
+        const legend = L.control({ position:'topright' });
+        legend.onAdd = function() {
+          const div = L.DomUtil.create('div','legend');
+          const h = document.createElement('div'); h.textContent = 'Incident Type';
+          h.style.fontWeight='600'; h.style.marginBottom='6px';
+          div.appendChild(h);
+          for (const norm of typeValues) {
+            const row = document.createElement('div'); row.className='row';
+            const sw = document.createElement('span'); sw.className='swatch'; sw.style.background = colors[norm];
+            const lab = document.createElement('span'); lab.textContent = typeLabelMap.get(norm);
+            row.appendChild(sw); row.appendChild(lab); div.appendChild(row);
+          }
+          return div;
+        };
+        legend.addTo(map);
+
+        status.textContent = `Plotted ${data.features.length} pins. Types: ${typeValues.length}`;
+
+        typeFilter.addEventListener('change', () => {
+          if (allCluster) map.removeLayer(allCluster);
+          const newCluster = L.markerClusterGroup({ spiderfyOnMaxZoom:true, showCoverageOnHover:false, maxClusterRadius:50 });
+          if (typeFilter.value === '__ALL__') {
+            Object.values(groupsByType).forEach(g => g.eachLayer(m => newCluster.addLayer(m)));
+          } else {
+            groupsByType[typeFilter.value].eachLayer(m => newCluster.addLayer(m));
+          }
+          newCluster.addTo(map);
+          const bb = newCluster.getBounds();
+          if (bb.isValid()) map.fitBounds(bb.pad(0.1));
+          const label = (typeFilter.value === '__ALL__') ? 'ALL types' : `"${typeLabelMap.get(typeFilter.value)}"`;
+          status.textContent = `Showing ${label}. Pins: ${newCluster.getLayers().length}`;
+          allCluster = newCluster;
+        });
+      })
+      .catch(err => { console.error(err); status.textContent = `Error: ${err.message}`; });
+  </script>
+</body>
+</html>
