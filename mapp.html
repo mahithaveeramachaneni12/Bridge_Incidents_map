@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Bridge Incidents — Pins + Type Filter</title>
+  <title>Bridge Incidents — CSV (coordinates (lat, lon))</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <!-- Leaflet -->
@@ -13,6 +13,9 @@
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
   <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+
+  <!-- PapaParse for CSV -->
+  <script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
 
   <style>
     html, body, #map { height: 100%; margin: 0; }
@@ -58,91 +61,24 @@
     const status = document.getElementById('status');
     const typeFilter = document.getElementById('typeFilter');
 
+    // CONFIG: change if your CSV uses a different column for incident type
+    const INCIDENT_KEY = 'Incident Type';
+
     // Helpers
-    function sanitizeJsonText(txt) {
-      return txt.replace(/\bNaN\b/g, 'null')
-                .replace(/\b-Infinity\b/g, 'null')
-                .replace(/\bInfinity\b/g, 'null');
+    function sanitizeText(txt) {
+      return txt.replace(/\bNaN\b/g, '')
+                .replace(/\b-Infinity\b/g, '')
+                .replace(/\bInfinity\b/g, '');
     }
-    function looksSwapped([x,y]) {
-      return (Math.abs(x) <= 90 && Math.abs(y) <= 180) && !(Math.abs(y) <= 90);
+    function keyLookup(obj, patterns) {
+      const keys = Object.keys(obj || {});
+      const found = keys.find(k => patterns.some(rx => rx.test(k)));
+      return found || null;
     }
-    function normalizeGeoJSON(gj) {
-      if (!gj || !Array.isArray(gj.features)) return { type:'FeatureCollection', features:[] };
-      const out = { type:'FeatureCollection', features:[] };
-      for (let f of gj.features) {
-        if (!f) continue;
-        if (!f.geometry) {
-          const p = f.properties || {};
-          const latK = Object.keys(p).find(k => /^(lat|latitude)$/i.test(k));
-          const lonK = Object.keys(p).find(k => /^(lon|lng|long|longitude)$/i.test(k));
-          if (latK && lonK) {
-            const lat = parseFloat(p[latK]), lon = parseFloat(p[lonK]);
-            if (isFinite(lat) && isFinite(lon)) {
-              out.features.push({ type:'Feature', properties:p, geometry:{ type:'Point', coordinates:[lon,lat] }});
-            }
-          }
-          continue;
-        }
-        if (f.geometry.type === 'Point' && Array.isArray(f.geometry.coordinates)) {
-          let [x,y] = f.geometry.coordinates;
-          x = parseFloat(x); y = parseFloat(y);
-          if (!isFinite(x) || !isFinite(y)) continue;
-          const coords = looksSwapped([x,y]) ? [y,x] : [x,y];
-          out.features.push({ type:'Feature', properties:f.properties || {}, geometry:{ type:'Point', coordinates:coords }});
-        }
-      }
-      return out;
+    function looksSwapped(lon, lat) {
+      // lon looks like a latitude and lat looks like a longitude
+      return Math.abs(lon) <= 90 && Math.abs(lat) > 90 && Math.abs(lat) <= 180;
     }
-
-    const palette = ["#e41a1c","#377eb8","#4daf4a","#984ea3","#ff7f00","#a65628","#f781bf","#999999",
-                     "#66c2a5","#fc8d62","#8da0cb","#e78ac3","#a6d854","#ffd92f","#e5c494","#b3b3b3"];
-
-    function colorMapFor(types) {
-      const m = {};
-      types.forEach((t,i) => m[t] = palette[i % palette.length]);
-      return m;
-    }
-
-    function makeSvgPin(color) {
-      return `
-        <svg width="24" height="36" viewBox="0 0 24 36" xmlns="http://www.w3.org/2000/svg">
-          <path d="M12 35c5-8 10-12 10-19C22 8.82 17.18 4 12 4S2 8.82 2 16c0 7 5 11 10 19z"
-                fill="${color}" stroke="rgba(0,0,0,0.45)" stroke-width="1"/>
-          <circle cx="12" cy="16" r="4.2" fill="white" opacity="0.9"/>
-        </svg>`;
-    }
-    function makePinIcon(color) {
-      return L.divIcon({
-        className: 'custom-pin',
-        html: makeSvgPin(color),
-        iconSize: [24, 36],
-        iconAnchor: [12, 34],
-        popupAnchor: [0, -30]
-      });
-    }
-
-    // Popup builder with links
-    function makePopup(props) {
-      if (!props) return '';
-      const rows = [];
-      const isUrl = v => typeof v === 'string' && /^https?:\/\//i.test(v);
-      const domainText = url => {
-        try { return new URL(url).hostname.replace(/^www\./, ''); }
-        catch { return url; }
-      };
-      for (const [k, rawV] of Object.entries(props)) {
-        if (rawV === null || rawV === undefined) continue;
-        let v = String(rawV).trim();
-        if (!v || v.toLowerCase() === 'null') continue;
-        if (isUrl(v)) {
-          v = `<a href="${rawV}" target="_blank" rel="noopener">${domainText(rawV)}</a>`;
-        }
-        rows.push(`<tr><th style="text-align:left; padding-right:8px;">${k}</th><td>${v}</td></tr>`);
-      }
-      return `<div style="font:13px/1.3 system-ui, Segoe UI, Roboto, Arial;"><table>${rows.join('')}</table></div>`;
-    }
-
     function normalizeType(v) {
       if (v == null) return null;
       v = String(v).toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
@@ -164,55 +100,140 @@
     function titleCase(s) {
       return String(s).replace(/\w\S*/g, t => t[0].toUpperCase() + t.slice(1).toLowerCase());
     }
+    function makePopup(props) {
+      if (!props) return '';
+      const rows = [];
+      const isUrl = v => typeof v === 'string' && /^https?:\/\//i.test(v);
+      const domainText = url => { try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return url; } };
+      for (const [k, rawV] of Object.entries(props)) {
+        if (rawV === null || rawV === undefined) continue;
+        let v = String(rawV).trim();
+        if (!v || v.toLowerCase() === 'null') continue;
+        if (isUrl(v)) v = `<a href="${rawV}" target="_blank" rel="noopener">${domainText(rawV)}</a>`;
+        rows.push(`<tr><th style="text-align:left; padding-right:8px;">${k}</th><td>${v}</td></tr>`);
+      }
+      return `<div style="font:13px/1.3 system-ui, Segoe UI, Roboto, Arial;"><table>${rows.join('')}</table></div>`;
+    }
 
-    let allCluster = null;
-    let groupsByType = {};
-    const INCIDENT_KEY = 'Incident Type';
+    const palette = ["#e41a1c","#377eb8","#4daf4a","#984ea3","#ff7f00","#a65628","#f781bf","#999999",
+                     "#66c2a5","#fc8d62","#8da0cb","#e78ac3","#a6d854","#ffd92f","#e5c494","#b3b3b3"];
+    function colorMapFor(types) {
+      const m = {};
+      types.forEach((t,i) => m[t] = palette[i % palette.length]);
+      return m;
+    }
 
-    fetch('bridge_incidents.geojson', { cache:'no-store' })
+    // Parse a single "coordinates (lat, lon)" value into {lat, lon}
+    function parseCoordsField(val) {
+      if (val == null) return null;
+      const s = String(val).trim();
+      // Extract first two numbers (handles "29.76, -95.36", "(29.76, -95.36)", "[29.76, -95.36]", "POINT(-95.36 29.76)" etc.)
+      const m = s.match(/-?\d+(?:\.\d+)?/g);
+      if (!m || m.length < 2) return null;
+
+      let lat = parseFloat(m[0]);
+      let lon = parseFloat(m[1]);
+
+      // Handle WKT-like "POINT(lon lat)" if exported that way
+      if (Math.abs(lat) > 90 && Math.abs(lon) <= 90) {
+        const tmp = lat; lat = lon; lon = tmp;
+      }
+      if (!isFinite(lat) || !isFinite(lon)) return null;
+      return { lat, lon };
+    }
+
+    // Load CSV -> rows -> features
+    fetch('Bridge_incident1.csv', { cache: 'no-store' })
       .then(r => r.text())
       .then(txt => {
-        const raw = JSON.parse(sanitizeJsonText(txt));
-        const data = normalizeGeoJSON(raw);
-        if (!data.features.length) throw new Error('No valid point features found.');
+        const csvText = sanitizeText(txt);
+        const parsed = Papa.parse(csvText, { header: true, dynamicTyping: true, skipEmptyLines: true });
+        const rows = parsed.data;
 
-        const typeLabelMap = new Map();
-        data.features.forEach(f => {
-          const norm = normalizeType(f.properties?.[INCIDENT_KEY]);
-          if (norm != null && !typeLabelMap.has(norm)) {
-            typeLabelMap.set(norm, titleCase(norm));
+        if (!rows.length) throw new Error('CSV seems empty.');
+
+        // Detect coordinate columns/field
+        const sample = rows[0] || {};
+        const latKey   = keyLookup(sample, [/^lat(i(tude)?)?$/i]);
+        const lonKey   = keyLookup(sample, [/^(lon(g(itude)?)?|lng)$/i]);
+        const coordKey = keyLookup(sample, [/^coordinates?\s*\(\s*lat\s*,\s*lon\s*\)$/i]); // "coordinates (lat, lon)"
+
+        if (!((latKey && lonKey) || coordKey)) {
+          throw new Error('Could not find latitude/longitude columns or a "coordinates (lat, lon)" column.');
+        }
+
+        const features = [];
+        for (const r of rows) {
+          let lat, lon;
+
+          if (coordKey) {
+            const pair = parseCoordsField(r[coordKey]);
+            if (!pair) continue;
+            ({ lat, lon } = pair); // (lat, lon)
+          } else {
+            lat = parseFloat(r[latKey]);
+            lon = parseFloat(r[lonKey]);
           }
-        });
+
+          if (!isFinite(lat) || !isFinite(lon)) continue;
+
+          // Safety swap if someone mixed the order
+          if (looksSwapped(lon, lat)) { const tmp = lat; lat = lon; lon = tmp; }
+
+          features.push({
+            type: "Feature",
+            properties: r,
+            geometry: { type: "Point", coordinates: [lon, lat] } // GeoJSON order
+          });
+        }
+
+        if (!features.length) throw new Error('No valid coordinates parsed from CSV.');
+
+        // Type normalization & palette
+        const typeLabelMap = new Map();
+        for (const f of features) {
+          const norm = normalizeType(f.properties?.[INCIDENT_KEY]);
+          if (norm != null && !typeLabelMap.has(norm)) typeLabelMap.set(norm, titleCase(norm));
+        }
         const typeValues = Array.from(typeLabelMap.keys()).sort();
         const colors = colorMapFor(typeValues);
 
+        // Populate filter UI
         for (const norm of typeValues) {
           const opt = document.createElement('option');
           opt.value = norm; opt.textContent = typeLabelMap.get(norm);
           typeFilter.appendChild(opt);
         }
 
-        groupsByType = {};
+        // Build layers + clusters (circle dots)
+        const groupsByType = {};
         typeValues.forEach(norm => groupsByType[norm] = L.layerGroup());
+        let allCluster = null;
         const cluster = L.markerClusterGroup({ spiderfyOnMaxZoom:true, showCoverageOnHover:false, maxClusterRadius:50 });
 
-        data.features.forEach(f => {
+        for (const f of features) {
           const tNorm = normalizeType(f.properties?.[INCIDENT_KEY]);
-          if (tNorm == null) return;
+          if (tNorm == null) continue;
           const [lon, lat] = f.geometry.coordinates;
-          const m = L.marker([lat, lon], {
-            icon: makePinIcon(colors[tNorm] || '#666'),
-            title: typeLabelMap.get(tNorm) || ''
+          const m = L.circleMarker([lat, lon], {
+            radius: 6,
+            fillColor: colors[tNorm] || '#666',
+            color: '#333',
+            weight: 1,
+            opacity: 1,
+            fillOpacity: 0.9
           }).bindPopup(makePopup(f.properties));
           groupsByType[tNorm].addLayer(m);
           cluster.addLayer(m);
-        });
+        }
 
         cluster.addTo(map);
         allCluster = cluster;
+
         const b = cluster.getBounds();
         if (b.isValid()) map.fitBounds(b.pad(0.1));
 
+        // Legend
         const legend = L.control({ position:'topright' });
         legend.onAdd = function() {
           const div = L.DomUtil.create('div','legend');
@@ -229,8 +250,9 @@
         };
         legend.addTo(map);
 
-        status.textContent = `Plotted ${data.features.length} pins. Types: ${typeValues.length}`;
+        status.textContent = `Plotted ${features.length} points. Types: ${typeValues.length}`;
 
+        // Filtering
         typeFilter.addEventListener('change', () => {
           if (allCluster) map.removeLayer(allCluster);
           const newCluster = L.markerClusterGroup({ spiderfyOnMaxZoom:true, showCoverageOnHover:false, maxClusterRadius:50 });
@@ -243,7 +265,7 @@
           const bb = newCluster.getBounds();
           if (bb.isValid()) map.fitBounds(bb.pad(0.1));
           const label = (typeFilter.value === '__ALL__') ? 'ALL types' : `"${typeLabelMap.get(typeFilter.value)}"`;
-          status.textContent = `Showing ${label}. Pins: ${newCluster.getLayers().length}`;
+          status.textContent = `Showing ${label}. Points: ${newCluster.getLayers().length}`;
           allCluster = newCluster;
         });
       })
