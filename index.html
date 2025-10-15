@@ -215,7 +215,7 @@
         if (tNorm == null) continue; // skip blank/unknown -> no first dot
         const [lon, lat] = f.geometry.coordinates;
         const marker = L.circleMarker([lat, lon], {
-          radius: 7,
+          radius: 4,
           fillColor: colors[tNorm] || '#666',
           color: '#333',
           weight: 1,
