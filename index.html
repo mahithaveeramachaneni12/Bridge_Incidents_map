@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Bridge Incidents — XLSX upload (merged types)</title>
+  <title>Bridge Incidents</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <!-- Leaflet -->
@@ -34,22 +34,44 @@
       padding: 6px 8px; border-radius: 6px; font: 12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
       box-shadow: 0 1px 4px rgba(0,0,0,0.15); max-width: 60vw; overflow: auto; max-height: 30vh; white-space: pre-wrap;
     }
-    select, input[type="file"] { padding: 4px 6px; }
+    select, button { padding: 4px 6px; }
+    .spacer { width: 10px; }
   </style>
 </head>
 <body>
   <div id="map"></div>
 
+  <!--
+    HOW TO USE (choose ONE of the two approaches below):
+    A) Load from a URL: set XLSX_URL to your .xlsx path (must be same-origin or CORS-enabled)
+    B) Embed the workbook in BASE64: paste into XLSX_BASE64 and set USE_EMBED=true
+  -->
+
   <div class="topbar">
-    <label for="file"><strong>Upload .xlsx:</strong></label>
-    <input id="file" type="file" accept=".xlsx,.xls" />
     <label for="typeFilter"><strong>Incident type:</strong></label>
     <select id="typeFilter"><option value="__ALL__">All types</option></select>
+    <span class="spacer"></span>
+    <button id="reload">Reload</button>
   </div>
 
-  <pre class="status" id="status">Choose an .xlsx file to plot…</pre>
+  <pre class="status" id="status">Loading workbook…</pre>
 
   <script>
+    // ======== CONFIGURE YOUR DATA SOURCE HERE ========
+    const USE_EMBED = false; // set true to use the embedded base64 below (Option B)
+
+    // Option A: Load from URL (recommended)
+    // Place your XLSX next to this file or provide an absolute URL with CORS enabled.
+    const XLSX_URL = 'Bridge Incident Case Database  (1).xlsx'; // e.g. './data/incidents.xlsx'
+
+    // Option B: Embedded base64 XLSX (paste your own; a tiny sample sheet is provided)
+    const XLSX_BASE64 =
+      'UEsDBBQABgAIAJ3Yq1QAAAAAAAAAAAAAAAAUAAAAd29ya2Jvb2sueGxzeG1s7JJNTsMwEIbv/Io' +
+      '...' + // <-- replace with your full base64 string
+      'AAAUEsBAhQAFAAIAAgAndirVAAAAAAAAAAAAAAAAAAUAAAAAAAAAAAAAACkgQAAAAB3b3JrYm9v' +
+      'ay54bHN4bWwAAQAAAAAAAQAAAFBLBQYAAAAAAQABAEYAAABVAAAAAAA=';
+    // ==================================================
+
     // --- Map ---
     const map = L.map('map', { preferCanvas: true }).setView([31, -99], 6);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -58,7 +80,7 @@
 
     const status = document.getElementById('status');
     const typeFilter = document.getElementById('typeFilter');
-    const fileInput = document.getElementById('file');
+    const reloadBtn = document.getElementById('reload');
 
     // If your sheet uses a different column for the incident type, change this:
     const INCIDENT_KEY = 'Incident Type';
@@ -77,7 +99,7 @@
       const isUrl = v => typeof v === 'string' && /^https?:\/\//i.test(v);
       const domainText = url => { try { return new URL(url).hostname.replace(/^www\./,''); } catch { return url; } };
       for (const [k, rawV] of Object.entries(props)) {
-        if (rawV === null || rawV === undefined) continue;
+        if (rawV == null) continue;
         let v = String(rawV).trim();
         if (!v || v.toLowerCase() === 'null') continue;
         if (isUrl(v)) v = `<a href="${rawV}" target="_blank" rel="noopener">${domainText(rawV)}</a>`;
@@ -101,54 +123,59 @@
       const m = s.match(/-?\d+(?:\.\d+)?/g);
       if (!m || m.length < 2) return null;
       let lat = parseFloat(m[0]), lon = parseFloat(m[1]);
-      if (Math.abs(lat) > 90 && Math.abs(lon) <= 90) { const t = lat; lat = lon; lon = t; } // WKT-style
+      if (Math.abs(lat) > 90 && Math.abs(lon) <= 90) { const t = lat; lat = lon; lon = t; }
       if (!isFinite(lat) || !isFinite(lon)) return null;
       return { lat, lon };
     }
 
-    // --- XLSX reading from an uploaded file ---
-    async function readXlsxFromFile(file) {
-      const buf = await file.arrayBuffer();
+    // --- XLSX reading helpers ---
+    async function readXlsxFromUrl(url) {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Failed to fetch ${url} (${res.status})`);
+      const buf = await res.arrayBuffer();
       const wb = XLSX.read(buf, { type: 'array' });
       if (!wb.SheetNames.length) throw new Error('Workbook has no sheets');
       const sheet = wb.Sheets[wb.SheetNames[0]];
-      return XLSX.utils.sheet_to_json(sheet, { defval: '', raw: true }); // array of row objects
+      return XLSX.utils.sheet_to_json(sheet, { defval: '', raw: true });
+    }
+
+    function readXlsxFromBase64(b64) {
+      // Convert base64 -> Uint8Array for SheetJS
+      const bin = atob(b64.replace(/^data:.*;base64,/, ''));
+      const len = bin.length;
+      const bytes = new Uint8Array(len);
+      for (let i=0; i<len; i++) bytes[i] = bin.charCodeAt(i);
+      const wb = XLSX.read(bytes, { type: 'array' });
+      if (!wb.SheetNames.length) throw new Error('Workbook has no sheets');
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      return XLSX.utils.sheet_to_json(sheet, { defval: '', raw: true });
     }
 
     // ---- INCIDENT TYPE NORMALIZATION + MERGING ----
-    // Canonical buckets we want to show
     const DISPLAY_LABELS = {
       'vehicle collision': 'Vehicle Collision',
       'structural issue': 'Structural Issue'
-      // everything else falls back to titleCase(norm)
     };
 
     function normalizeType(v) {
       if (v == null) return null;
       v = String(v).toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
-      if (!v) return null; // prevent blank category (removes the first empty dot)
-
-      // unify common plurals
+      if (!v) return null;
       if (/ies$/.test(v)) v = v.replace(/ies$/, 'y');
       else if (/(ses|xes|zes|ches|shes)$/.test(v)) v = v.replace(/es$/, '');
       else if (v.endsWith('s') && !v.endsWith('ss')) v = v.slice(0, -1);
-
-      // merge synonyms / buckets:
       const alias = {
-        // vehicle bucket
         'vehicle collision': 'vehicle collision',
         'vehicle overload':  'vehicle collision',
         'overloaded truck':  'vehicle collision',
         'truck overload':    'vehicle collision',
         'overload truck':    'vehicle collision',
-        // structural bucket
         'structure failure': 'structural issue',
         'structural failure':'structural issue',
         'hole found in bridge': 'structural issue',
         'hole on bridge':       'structural issue'
       };
       if (alias[v]) v = alias[v];
-
       return v;
     }
 
@@ -157,9 +184,9 @@
     }
 
     // --- plotting state ---
-    let currentLayer = null;        // L.FeatureGroup holding current markers
-    let groupsByType = {};          // { normType: Marker[] }
-    let allMarkers = [];            // all markers
+    let currentLayer = null;
+    let groupsByType = {};
+    let allMarkers = [];
 
     async function plotFromRows(rows) {
       if (!rows.length) throw new Error('Sheet seems empty.');
@@ -187,7 +214,6 @@
       }
       if (!features.length) throw new Error('No valid coordinates parsed from sheet.');
 
-      // Clear previous stuff
       if (currentLayer) { map.removeLayer(currentLayer); currentLayer = null; }
       document.querySelectorAll('.legend').forEach(el => el.remove());
       typeFilter.value = '__ALL__';
@@ -195,7 +221,6 @@
       groupsByType = {};
       allMarkers = [];
 
-      // Build filter + colors
       const typeSet = new Set();
       for (const f of features) {
         const norm = normalizeType(f.properties?.[INCIDENT_KEY]);
@@ -209,10 +234,9 @@
         groupsByType[norm] = [];
       }
 
-      // Create markers
       for (const f of features) {
         const tNorm = normalizeType(f.properties?.[INCIDENT_KEY]);
-        if (tNorm == null) continue; // skip blank/unknown -> no first dot
+        if (tNorm == null) continue;
         const [lon, lat] = f.geometry.coordinates;
         const marker = L.circleMarker([lat, lon], {
           radius: 4,
@@ -226,11 +250,9 @@
         allMarkers.push(marker);
       }
 
-      // Add initial layer (all markers)
       currentLayer = L.featureGroup(allMarkers).addTo(map);
       const b = currentLayer.getBounds(); if (b.isValid()) map.fitBounds(b.pad(0.1));
 
-      // Legend
       const legend = L.control({ position:'topright' });
       legend.onAdd = function() {
         const div = L.DomUtil.create('div','legend');
@@ -239,7 +261,7 @@
         div.appendChild(h);
         for (const norm of typeValues) {
           const label = displayLabel(norm);
-          if (!label) continue; // safety; skip blanks
+          if (!label) continue;
           const row = document.createElement('div'); row.className='row';
           const sw = document.createElement('span'); sw.className='swatch'; sw.style.background = colors[norm];
           const lab = document.createElement('span'); lab.textContent = label;
@@ -251,7 +273,6 @@
 
       status.textContent = `Plotted ${allMarkers.length} points. Types: ${typeValues.length}`;
 
-      // Filtering (rebuild the featureGroup)
       typeFilter.onchange = () => {
         if (currentLayer) map.removeLayer(currentLayer);
         let markersToShow = [];
@@ -267,19 +288,26 @@
       };
     }
 
-    // Handle file selection
-    fileInput.addEventListener('change', async () => {
-      const file = fileInput.files?.[0];
-      if (!file) return;
-      status.textContent = `Reading ${file.name}…`;
+    // --- bootstrap ---
+    async function loadAndPlot() {
       try {
-        const rows = await readXlsxFromFile(file);
+        status.textContent = USE_EMBED
+          ? 'Reading embedded workbook…'
+          : `Fetching ${XLSX_URL}…`;
+
+        const rows = USE_EMBED
+          ? readXlsxFromBase64(XLSX_BASE64)
+          : await readXlsxFromUrl(XLSX_URL);
+
         await plotFromRows(rows);
       } catch (err) {
         console.error(err);
-        status.textContent = `Error: ${err.message}`;
+        status.textContent = `Error: ${err.message}\n\nTips:\n• If using a URL, make sure it is same-origin or CORS-enabled.\n• Verify the first sheet has either Lat/Lon columns or a "coordinates (lat, lon)" column.`;
       }
-    });
+    }
+
+    reloadBtn.addEventListener('click', loadAndPlot);
+    window.addEventListener('DOMContentLoaded', loadAndPlot);
   </script>
 </body>
 </html>
